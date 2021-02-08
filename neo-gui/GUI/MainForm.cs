@@ -4,7 +4,6 @@ using Neo.IO.Actors;
 using Neo.Ledger;
 using Neo.Network.P2P;
 using Neo.Network.P2P.Payloads;
-using Neo.Persistence;
 using Neo.Properties;
 using Neo.SmartContract;
 using Neo.SmartContract.Native;
@@ -151,7 +150,7 @@ namespace Neo.GUI
             foreach (ListViewItem item in listView3.Items)
             {
                 uint? height = item.Tag as uint?;
-                int? confirmations = (int)Blockchain.Singleton.Height - (int?)height + 1;
+                int? confirmations = (int)NativeContract.Ledger.CurrentIndex(Blockchain.Singleton.View) - (int?)height + 1;
                 if (confirmations <= 0) confirmations = null;
                 item.SubItems["confirmations"].Text = confirmations?.ToString() ?? Strings.Unconfirmed;
             }
@@ -172,8 +171,10 @@ namespace Neo.GUI
 
         private void timer1_Tick(object sender, EventArgs e)
         {
-            lbl_height.Text = $"{Blockchain.Singleton.Height}/{Blockchain.Singleton.HeaderHeight}";
+            uint height = NativeContract.Ledger.CurrentIndex(Blockchain.Singleton.View);
+            uint headerHeight = Blockchain.Singleton.HeaderCache.Last?.Index ?? height;
 
+            lbl_height.Text = $"{height}/{headerHeight}";
             lbl_count_node.Text = LocalNode.Singleton.ConnectedCount.ToString();
             TimeSpan persistence_span = DateTime.UtcNow - persistence_time;
             if (persistence_span < TimeSpan.Zero) persistence_span = TimeSpan.Zero;
@@ -191,7 +192,7 @@ namespace Neo.GUI
             check_nep5_balance = false;
             UInt160[] addresses = Service.CurrentWallet.GetAccounts().Select(p => p.ScriptHash).ToArray();
             if (addresses.Length == 0) return;
-            using SnapshotView snapshot = Blockchain.Singleton.GetSnapshot();
+            using var snapshot = Blockchain.Singleton.GetSnapshot();
             foreach (UInt160 assetId in NEP5Watched)
             {
                 byte[] script;

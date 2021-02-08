@@ -6,7 +6,6 @@ using Neo.IO.Json;
 using Neo.Ledger;
 using Neo.Network.P2P;
 using Neo.Network.P2P.Payloads;
-using Neo.Persistence;
 using Neo.Plugins;
 using Neo.SmartContract;
 using Neo.SmartContract.Manifest;
@@ -23,6 +22,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Net;
+using System.Numerics;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -32,6 +32,8 @@ namespace Neo.CLI
     public partial class MainService : ConsoleServiceBase, IWalletProvider
     {
         public event EventHandler<Wallet> WalletOpened;
+
+        public const long TestModeGas = 20_00000000;
 
         private Wallet currentWallet;
         public Wallet CurrentWallet
@@ -176,7 +178,8 @@ namespace Neo.CLI
             uint start = read_start ? r.ReadUInt32() : 0;
             uint count = r.ReadUInt32();
             uint end = start + count - 1;
-            if (end <= Blockchain.Singleton.Height) yield break;
+            uint currentHeight = NativeContract.Ledger.CurrentIndex(Blockchain.Singleton.View);
+            if (end <= currentHeight) yield break;
             for (uint height = start; height <= end; height++)
             {
                 var size = r.ReadInt32();
@@ -184,7 +187,7 @@ namespace Neo.CLI
                     throw new ArgumentException($"Block {height} exceeds the maximum allowed size");
 
                 byte[] array = r.ReadBytes(size);
-                if (height > Blockchain.Singleton.Height)
+                if (height > currentHeight)
                 {
                     Block block = array.AsSerializable<Block>();
                     yield return block;
@@ -215,9 +218,10 @@ namespace Neo.CLI
                 IsCompressed = p.EndsWith(".zip")
             }).OrderBy(p => p.Start);
 
+            uint height = NativeContract.Ledger.CurrentIndex(Blockchain.Singleton.View);
             foreach (var path in paths)
             {
-                if (path.Start > Blockchain.Singleton.Height + 1) break;
+                if (path.Start > height + 1) break;
                 if (path.IsCompressed)
                     using (FileStream fs = new FileStream(path.FileName, FileMode.Open, FileAccess.Read, FileShare.Read))
                     using (ZipArchive zip = new ZipArchive(fs, ZipArchiveMode.Read))
@@ -238,7 +242,7 @@ namespace Neo.CLI
             return true;
         }
 
-        private byte[] LoadDeploymentScript(string nefFilePath, string manifestFilePath, out NefFile nef)
+        private byte[] LoadDeploymentScript(string nefFilePath, string manifestFilePath, out NefFile nef, out ContractManifest manifest)
         {
             if (string.IsNullOrEmpty(manifestFilePath))
             {
@@ -253,7 +257,7 @@ namespace Neo.CLI
                 throw new ArgumentException(nameof(manifestFilePath));
             }
 
-            var manifest = ContractManifest.Parse(File.ReadAllBytes(manifestFilePath));
+            manifest = ContractManifest.Parse(File.ReadAllBytes(manifestFilePath));
 
             // Read nef
 
@@ -441,7 +445,7 @@ namespace Neo.CLI
             {
                 for (uint i = start; i <= end; i++)
                 {
-                    Block block = Blockchain.Singleton.GetBlock(i);
+                    Block block = NativeContract.Ledger.GetBlock(Blockchain.Singleton.View, i);
                     byte[] array = block.ToArray();
                     fs.Write(BitConverter.GetBytes(array.Length), 0, sizeof(int));
                     fs.Write(array, 0, array.Length);
@@ -463,13 +467,14 @@ namespace Neo.CLI
         /// </summary>
         /// <param name="script">script</param>
         /// <param name="account">sender</param>
-        private void SendTransaction(byte[] script, UInt160 account = null)
+        /// <param name="gas">Max fee for running the script</param>
+        private void SendTransaction(byte[] script, UInt160 account = null, long gas = TestModeGas)
         {
             Signer[] signers = System.Array.Empty<Signer>();
 
             if (account != null)
             {
-                using (SnapshotView snapshot = Blockchain.Singleton.GetSnapshot())
+                using (var snapshot = Blockchain.Singleton.GetSnapshot())
                 {
                     signers = CurrentWallet.GetAccounts()
                     .Where(p => !p.Lock && !p.WatchOnly && p.ScriptHash == account && NativeContract.GAS.BalanceOf(snapshot, p.ScriptHash).Sign > 0)
@@ -480,10 +485,10 @@ namespace Neo.CLI
 
             try
             {
-                Transaction tx = CurrentWallet.MakeTransaction(script, account, signers);
+                Transaction tx = CurrentWallet.MakeTransaction(script, account, signers, maxGas: gas);
                 Console.WriteLine($"Invoking script with: '{tx.Script.ToBase64String()}'");
 
-                using (ApplicationEngine engine = ApplicationEngine.Run(tx.Script, container: tx))
+                using (ApplicationEngine engine = ApplicationEngine.Run(tx.Script, container: tx, gas: gas))
                 {
                     PrintExecutionOutput(engine, true);
                     if (engine.State == VMState.FAULT) return;
@@ -513,8 +518,10 @@ namespace Neo.CLI
         /// <param name="result">Result</param>
         /// <param name="verificable">Transaction</param>
         /// <param name="contractParameters">Contract parameters</param>
+        /// <param name="showStack">Show result stack if it is true</param>
+        /// <param name="gas">Max fee for running the script</param>
         /// <returns>Return true if it was successful</returns>
-        private bool OnInvokeWithResult(UInt160 scriptHash, string operation, out StackItem result, IVerifiable verificable = null, JArray contractParameters = null, bool showStack = true)
+        private bool OnInvokeWithResult(UInt160 scriptHash, string operation, out StackItem result, IVerifiable verificable = null, JArray contractParameters = null, bool showStack = true, long gas = TestModeGas)
         {
             List<ContractParameter> parameters = new List<ContractParameter>();
 
@@ -526,8 +533,7 @@ namespace Neo.CLI
                 }
             }
 
-            var snapshot = Blockchain.Singleton.GetSnapshot();
-            ContractState contract = NativeContract.ContractManagement.GetContract(snapshot, scriptHash);
+            ContractState contract = NativeContract.ContractManagement.GetContract(Blockchain.Singleton.View, scriptHash);
             if (contract == null)
             {
                 Console.WriteLine("Contract does not exist.");
@@ -536,7 +542,7 @@ namespace Neo.CLI
             }
             else
             {
-                if (contract.Manifest.Abi.GetMethod(operation) == null)
+                if (contract.Manifest.Abi.GetMethod(operation, parameters.Count) == null)
                 {
                     Console.WriteLine("This method does not not exist in this contract.");
                     result = StackItem.Null;
@@ -558,7 +564,7 @@ namespace Neo.CLI
                 tx.Script = script;
             }
 
-            using ApplicationEngine engine = ApplicationEngine.Run(script, container: verificable);
+            using ApplicationEngine engine = ApplicationEngine.Run(script, container: verificable, gas: gas);
             PrintExecutionOutput(engine, showStack);
             result = engine.State == VMState.FAULT ? null : engine.ResultStack.Peek();
             return engine.State != VMState.FAULT;
@@ -567,7 +573,7 @@ namespace Neo.CLI
         private void PrintExecutionOutput(ApplicationEngine engine, bool showStack = true)
         {
             Console.WriteLine($"VM State: {engine.State}");
-            Console.WriteLine($"Gas Consumed: {new BigDecimal(engine.GasConsumed, NativeContract.GAS.Decimals)}");
+            Console.WriteLine($"Gas Consumed: {new BigDecimal((BigInteger)engine.GasConsumed, NativeContract.GAS.Decimals)}");
 
             if (showStack)
                 Console.WriteLine($"Result Stack: {new JArray(engine.ResultStack.Select(p => p.ToJson()))}");

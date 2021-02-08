@@ -4,6 +4,7 @@ using Neo.Network.P2P.Payloads;
 using Neo.SmartContract.Native;
 using System;
 using System.Linq;
+using System.Numerics;
 
 namespace Neo.CLI
 {
@@ -18,7 +19,7 @@ namespace Neo.CLI
         private void OnDeployCommand(string filePath, string manifestPath = null)
         {
             if (NoWallet()) return;
-            byte[] script = LoadDeploymentScript(filePath, manifestPath, out var nef);
+            byte[] script = LoadDeploymentScript(filePath, manifestPath, out var nef, out var manifest);
 
             Transaction tx;
             try
@@ -31,10 +32,10 @@ namespace Neo.CLI
                 return;
             }
 
-            UInt160 hash = SmartContract.Helper.GetContractHash(tx.Sender, nef.Script);
+            UInt160 hash = SmartContract.Helper.GetContractHash(tx.Sender, nef.CheckSum, manifest.Name);
 
             Console.WriteLine($"Contract hash: {hash}");
-            Console.WriteLine($"Gas: {new BigDecimal(tx.SystemFee, NativeContract.GAS.Decimals)}");
+            Console.WriteLine($"Gas: {new BigDecimal((BigInteger)tx.SystemFee, NativeContract.GAS.Decimals)}");
             Console.WriteLine();
             SignAndSendTx(tx);
         }
@@ -47,9 +48,11 @@ namespace Neo.CLI
         /// <param name="contractParameters">Contract parameters</param>
         /// <param name="sender">Transaction's sender</param>
         /// <param name="signerAccounts">Signer's accounts</param>
+        /// <param name="masGas">Max fee for running the script</param>
         [ConsoleCommand("invoke", Category = "Contract Commands")]
-        private void OnInvokeCommand(UInt160 scriptHash, string operation, JArray contractParameters = null, UInt160 sender = null, UInt160[] signerAccounts = null)
+        private void OnInvokeCommand(UInt160 scriptHash, string operation, JArray contractParameters = null, UInt160 sender = null, UInt160[] signerAccounts = null, decimal maxGas = 20)
         {
+            var gas = new BigDecimal(maxGas, NativeContract.GAS.Decimals);
             Signer[] signers = Array.Empty<Signer>();
             if (signerAccounts != null && !NoWallet())
             {
@@ -76,12 +79,12 @@ namespace Neo.CLI
                 Witnesses = Array.Empty<Witness>(),
             };
 
-            if (!OnInvokeWithResult(scriptHash, operation, out _, tx, contractParameters)) return;
+            if (!OnInvokeWithResult(scriptHash, operation, out _, tx, contractParameters, gas: (long)gas.Value)) return;
 
             if (NoWallet()) return;
             try
             {
-                tx = CurrentWallet.MakeTransaction(tx.Script, sender, signers);
+                tx = CurrentWallet.MakeTransaction(tx.Script, sender, signers, maxGas: (long)gas.Value);
             }
             catch (InvalidOperationException e)
             {
